@@ -1,0 +1,45 @@
+version: 2
+
+project_name: hidybot
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: hidybot
+    main: ./cmd/bot
+    binary: hidybot
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+      - arm
+    goarm:
+      - "7"
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+# Publish raw binaries named hidybot_linux_<arch> so install.sh can fetch them
+# directly from /releases/latest/download/.
+archives:
+  - id: bin
+    format: binary
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+release:
+  draft: false
+  prerelease: auto
+  name_template: "hidybot {{ .Tag }}"
+
+changelog:
+  use: github
+  sort: asc

@@ -1,0 +1,18 @@
+# build output
+/dist/
+/hidybot
+*.exe
+
+# local runtime data
+*.db
+*.db-wal
+*.db-shm
+*.db.gz
+/backups/
+config.env
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/
+.claude/
