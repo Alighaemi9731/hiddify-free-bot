@@ -25,6 +25,15 @@ const (
 	cbPanelAdd    = "padd"
 	cbAdminAdd    = "aadd"
 	cbAdminDel    = "adel"
+	cbUsersList   = "ulist"
+	cbUserOpen    = "uopen"
+	cbUserSearch  = "usearch"
+	cbUserBan     = "uban"
+	cbUserBonus   = "ubonus"
+	cbUserCap     = "ucap"
+	cbUserMsg     = "umsg"
+	cbUserDel     = "udel"
+	cbUserDelYes  = "udelyes"
 	cbNoop        = "noop"
 )
 

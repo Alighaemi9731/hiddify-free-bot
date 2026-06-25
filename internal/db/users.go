@@ -1,5 +1,7 @@
 package db
 
+import "strings"
+
 // UpsertUser ensures a user row exists and refreshes the profile fields.
 func (s *Store) UpsertUser(tgID int64, username, firstName string) error {
 	_, err := s.db.Exec(`
@@ -12,15 +14,77 @@ func (s *Store) UpsertUser(tgID int64, username, firstName string) error {
 
 // GetUser returns a user or nil if absent.
 func (s *Store) GetUser(tgID int64) (*User, error) {
+	return scanUser(s.db.QueryRow(`SELECT `+userCols+` FROM users WHERE tg_id=?`, tgID).Scan)
+}
+
+const userCols = `tg_id,username,first_name,referrer_id,referrals_count,
+	manual_bonus_mb,daily_cap_override_mb,banned,last_claim_date,created_at`
+
+func scanUser(scan func(...any) error) (*User, error) {
 	u := &User{}
-	err := s.db.QueryRow(`SELECT tg_id,username,first_name,referrer_id,referrals_count,
-		manual_bonus_mb,daily_cap_override_mb,banned,last_claim_date,created_at
-		FROM users WHERE tg_id=?`, tgID).Scan(&u.TGID, &u.Username, &u.FirstName, &u.ReferrerID,
-		&u.ReferralsCount, &u.ManualBonusMB, &u.DailyCapOverride, &u.Banned, &u.LastClaimDate, &u.CreatedAt)
+	err := scan(&u.TGID, &u.Username, &u.FirstName, &u.ReferrerID, &u.ReferralsCount,
+		&u.ManualBonusMB, &u.DailyCapOverride, &u.Banned, &u.LastClaimDate, &u.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
 	return u, nil
+}
+
+// CountUsers returns the total number of known users.
+func (s *Store) CountUsers() int {
+	var n int
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&n)
+	return n
+}
+
+// ListUsers returns a page of users, newest first.
+func (s *Store) ListUsers(offset, limit int) ([]*User, error) {
+	rows, err := s.db.Query(`SELECT `+userCols+` FROM users
+		ORDER BY created_at DESC, tg_id DESC LIMIT ? OFFSET ?`, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*User
+	for rows.Next() {
+		u, err := scanUser(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+// FindUserByUsername looks up a user by (case-insensitive) username, no '@'.
+func (s *Store) FindUserByUsername(name string) (*User, error) {
+	name = strings.TrimPrefix(strings.TrimSpace(name), "@")
+	return scanUser(s.db.QueryRow(`SELECT `+userCols+` FROM users
+		WHERE lower(username)=lower(?) LIMIT 1`, name).Scan)
+}
+
+// DeleteUserFull removes a user and all of their related rows.
+func (s *Store) DeleteUserFull(tgID int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, q := range []string{
+		`DELETE FROM users WHERE tg_id=?`,
+		`DELETE FROM daily_claims WHERE tg_id=?`,
+		`DELETE FROM channel_user WHERE tg_id=?`,
+		`DELETE FROM referrals WHERE referee_id=? OR referrer_id=?`,
+	} {
+		args := []any{tgID}
+		if strings.Contains(q, "referrals") {
+			args = append(args, tgID)
+		}
+		if _, err := tx.Exec(q, args...); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // UserExists reports whether the user is already known.

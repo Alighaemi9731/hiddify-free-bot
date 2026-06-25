@@ -99,6 +99,15 @@ func (b *Bot) registerHandlers() {
 	b.tb.Handle(&tele.Btn{Unique: cbPanelAdd}, b.cbPanelAdd)
 	b.tb.Handle(&tele.Btn{Unique: cbAdminAdd}, b.cbAdminAdd)
 	b.tb.Handle(&tele.Btn{Unique: cbAdminDel}, b.cbAdminDelete)
+	b.tb.Handle(&tele.Btn{Unique: cbUsersList}, b.cbUsersList)
+	b.tb.Handle(&tele.Btn{Unique: cbUserOpen}, b.cbUserOpen)
+	b.tb.Handle(&tele.Btn{Unique: cbUserSearch}, b.cbUserSearch)
+	b.tb.Handle(&tele.Btn{Unique: cbUserBan}, b.cbUserBan)
+	b.tb.Handle(&tele.Btn{Unique: cbUserBonus}, b.cbUserBonus)
+	b.tb.Handle(&tele.Btn{Unique: cbUserCap}, b.cbUserCap)
+	b.tb.Handle(&tele.Btn{Unique: cbUserMsg}, b.cbUserMsg)
+	b.tb.Handle(&tele.Btn{Unique: cbUserDel}, b.cbUserDelete)
+	b.tb.Handle(&tele.Btn{Unique: cbUserDelYes}, b.cbUserDeleteConfirm)
 	b.tb.Handle(&tele.Btn{Unique: cbNoop}, func(c tele.Context) error { return c.Respond() })
 }
 

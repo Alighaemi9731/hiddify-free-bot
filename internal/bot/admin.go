@@ -354,13 +354,66 @@ func (b *Bot) cbSetting(c tele.Context) error {
 
 // ============================ USERS ============================
 
+const usersPageSize = 8
+
 func (b *Bot) adminUsers(c tele.Context) error {
-	st := b.setState(c.Sender().ID, "find_user")
-	_ = st
-	return c.Send("آیدی عددی کاربر را بفرستید تا مدیریتش کنید.\n(کاربر می‌تواند با /myid آیدی‌اش را ببیند.)", cancelMenu())
+	return b.renderUserList(c, 0, false)
 }
 
-func (b *Bot) showUserCard(c tele.Context, u *db.User) error {
+// renderUserList shows one page of users (newest first) with a button per user.
+func (b *Bot) renderUserList(c tele.Context, page int, edit bool) error {
+	total := b.store.CountUsers()
+	pages := (total + usersPageSize - 1) / usersPageSize
+	if pages == 0 {
+		pages = 1
+	}
+	if page < 0 {
+		page = 0
+	}
+	if page >= pages {
+		page = pages - 1
+	}
+	users, err := b.store.ListUsers(page*usersPageSize, usersPageSize)
+	if err != nil {
+		return c.Send("خطا در دریافت کاربران.")
+	}
+
+	m := &tele.ReplyMarkup{}
+	var rows []tele.Row
+	for _, u := range users {
+		rows = append(rows, m.Row(m.Data(userRowLabel(u), cbUserOpen, strconv.FormatInt(u.TGID, 10))))
+	}
+	rows = append(rows, m.Row(
+		m.Data("◀️ قبلی", cbUsersList, strconv.Itoa(page-1)),
+		m.Data(fmt.Sprintf("صفحه %d/%d", page+1, pages), cbNoop, "x"),
+		m.Data("بعدی ▶️", cbUsersList, strconv.Itoa(page+1)),
+	))
+	rows = append(rows, m.Row(m.Data("🔍 جستجو با آیدی یا یوزرنیم", cbUserSearch, "go")))
+	m.Inline(rows...)
+
+	text := fmt.Sprintf("👥 مدیریت کاربران — مجموع: %d نفر\nروی هر کاربر بزنید تا مدیریتش کنید:", total)
+	if edit {
+		return c.Edit(text, m)
+	}
+	return c.Send(text, m)
+}
+
+func userRowLabel(u *db.User) string {
+	name := u.FirstName
+	if name == "" && u.Username != "" {
+		name = "@" + u.Username
+	}
+	if name == "" {
+		name = "کاربر"
+	}
+	label := fmt.Sprintf("👤 %s · %d", name, u.TGID)
+	if u.Banned {
+		label = "🚫 " + label
+	}
+	return label
+}
+
+func userCardText(b *Bot, u *db.User) string {
 	cap := b.store.DailyCapMB(u)
 	banned := "خیر"
 	if u.Banned {
@@ -370,21 +423,132 @@ func (b *Bot) showUserCard(c tele.Context, u *db.User) error {
 	if u.DailyCapOverride > 0 {
 		ov = fmtVol(u.DailyCapOverride)
 	}
-	msg := fmt.Sprintf(`👤 کاربر %d
-نام: %s (@%s)
+	uname := "—"
+	if u.Username != "" {
+		uname = "@" + u.Username
+	}
+	return fmt.Sprintf(`👤 کاربر %d
+نام: %s (%s)
 سقف روزانه فعلی: %s
 دعوت موفق: %d | پاداش دستی: %s
 override سقف: %s
-مسدود: %s
+مسدود: %s`,
+		u.TGID, u.FirstName, uname, fmtVol(cap), u.ReferralsCount, fmtVol(u.ManualBonusMB), ov, banned)
+}
 
-دستورها (همینجا بفرستید):
-• ban  — مسدود کردن
-• unban — رفع مسدودی
-• bonus <عدد MB> — افزودن حجم دستی
-• cap <عدد MB> — تعیین سقف ثابت (0 = حذف)`,
-		u.TGID, u.FirstName, u.Username, fmtVol(cap), u.ReferralsCount,
-		fmtVol(u.ManualBonusMB), ov, banned)
-	return c.Send(msg, cancelMenu())
+func userCardKeyboard(u *db.User) *tele.ReplyMarkup {
+	m := &tele.ReplyMarkup{}
+	id := strconv.FormatInt(u.TGID, 10)
+	ban := "🚫 مسدود کردن"
+	if u.Banned {
+		ban = "✅ رفع مسدودی"
+	}
+	m.Inline(
+		m.Row(m.Data(ban, cbUserBan, id)),
+		m.Row(m.Data("🎁 پاداش حجم", cbUserBonus, id), m.Data("📦 سقف ثابت", cbUserCap, id)),
+		m.Row(m.Data("✉️ پیام به کاربر", cbUserMsg, id), m.Data("🗑 حذف کاربر", cbUserDel, id)),
+		m.Row(m.Data("🔙 بازگشت به لیست", cbUsersList, "0")),
+	)
+	return m
+}
+
+// showUserCard renders a user's card (edit in place when invoked from a callback).
+func (b *Bot) showUserCard(c tele.Context, u *db.User, edit bool) error {
+	if edit {
+		return c.Edit(userCardText(b, u), userCardKeyboard(u))
+	}
+	return c.Send(userCardText(b, u), userCardKeyboard(u))
+}
+
+func (b *Bot) cbUsersList(c tele.Context) error {
+	_ = c.Respond()
+	page, _ := strconv.Atoi(c.Data())
+	return b.renderUserList(c, page, true)
+}
+
+func (b *Bot) cbUserSearch(c tele.Context) error {
+	_ = c.Respond()
+	b.setState(c.Sender().ID, "find_user")
+	return c.Send("آیدی عددی یا یوزرنیم (مثل @user) کاربر را بفرستید.", cancelMenu())
+}
+
+// openUserByID loads a user and shows their card; used by callbacks.
+func (b *Bot) openUserByID(c tele.Context, id int64, edit bool) error {
+	u, err := b.store.GetUser(id)
+	if err != nil {
+		_ = c.Respond(&tele.CallbackResponse{Text: "کاربر یافت نشد"})
+		return nil
+	}
+	return b.showUserCard(c, u, edit)
+}
+
+func (b *Bot) cbUserOpen(c tele.Context) error {
+	_ = c.Respond()
+	id, _ := strconv.ParseInt(c.Data(), 10, 64)
+	return b.openUserByID(c, id, true)
+}
+
+func (b *Bot) cbUserBan(c tele.Context) error {
+	id, _ := strconv.ParseInt(c.Data(), 10, 64)
+	u, err := b.store.GetUser(id)
+	if err != nil {
+		return c.RespondText("یافت نشد")
+	}
+	_ = b.store.SetBan(id, !u.Banned)
+	_ = c.Respond(&tele.CallbackResponse{Text: "انجام شد ✅"})
+	return b.openUserByID(c, id, true)
+}
+
+func (b *Bot) cbUserBonus(c tele.Context) error {
+	_ = c.Respond()
+	st := b.setState(c.Sender().ID, "user_bonus")
+	st.Data["uid"] = c.Data()
+	return c.Send("مقدار پاداش حجم را به مگابایت بفرستید (عدد). ۰ = حذف پاداش.", cancelMenu())
+}
+
+func (b *Bot) cbUserCap(c tele.Context) error {
+	_ = c.Respond()
+	st := b.setState(c.Sender().ID, "user_cap")
+	st.Data["uid"] = c.Data()
+	return c.Send("سقف ثابت روزانه را به مگابایت بفرستید (عدد). ۰ = حذف سقف ثابت.", cancelMenu())
+}
+
+func (b *Bot) cbUserMsg(c tele.Context) error {
+	_ = c.Respond()
+	st := b.setState(c.Sender().ID, "user_msg")
+	st.Data["uid"] = c.Data()
+	return c.Send("پیامی که می‌خواهید برای این کاربر ارسال شود را بفرستید (متن/عکس/فایل).", cancelMenu())
+}
+
+func (b *Bot) cbUserDelete(c tele.Context) error {
+	_ = c.Respond()
+	id := c.Data()
+	m := &tele.ReplyMarkup{}
+	m.Inline(m.Row(
+		m.Data("✅ بله، حذف کن", cbUserDelYes, id),
+		m.Data("✖️ انصراف", cbUserOpen, id),
+	))
+	return c.Edit("⚠️ از حذف کامل این کاربر مطمئنی؟ همه‌ی اطلاعاتش پاک می‌شود.", m)
+}
+
+func (b *Bot) cbUserDeleteConfirm(c tele.Context) error {
+	id, _ := strconv.ParseInt(c.Data(), 10, 64)
+	if err := b.store.DeleteUserFull(id); err != nil {
+		return c.RespondText("خطا در حذف")
+	}
+	b.store.Audit(c.Sender().ID, "user_delete", c.Data())
+	_ = c.Respond(&tele.CallbackResponse{Text: "حذف شد ✅"})
+	return b.renderUserList(c, 0, true)
+}
+
+// deliverAdminDM forwards the admin's message to a target user.
+func (b *Bot) deliverAdminDM(c tele.Context, st *UserState) error {
+	id, _ := strconv.ParseInt(st.Data["uid"], 10, 64)
+	b.clearState(c.Sender().ID)
+	if _, err := b.tb.Copy(tele.ChatID(id), c.Message()); err != nil {
+		return b.showAdminMenu(c, "❌ ارسال نشد (شاید کاربر ربات را بلاک کرده).")
+	}
+	return b.showAdminMenu(c, "✅ پیام برای کاربر ارسال شد.")
 }
 
 // ============================ BROADCAST ============================
@@ -488,7 +652,6 @@ func (b *Bot) handleStateInput(c tele.Context, st *UserState) error {
 		b.clearState(c.Sender().ID)
 		return b.showUserMenu(c, "")
 	}
-	txt := strings.TrimSpace(c.Text())
 	switch st.Action {
 	case "add_channel":
 		return b.fsmAddChannel(c, st)
@@ -506,8 +669,12 @@ func (b *Bot) handleStateInput(c tele.Context, st *UserState) error {
 		return b.fsmSetSetting(c, st)
 	case "find_user":
 		return b.fsmFindUser(c, st)
-	case "manage_user":
-		return b.fsmManageUser(c, st, txt)
+	case "user_bonus":
+		return b.fsmUserNumber(c, st, true)
+	case "user_cap":
+		return b.fsmUserNumber(c, st, false)
+	case "user_msg":
+		return b.deliverAdminDM(c, st)
 	case "add_admin":
 		return b.fsmAddAdmin(c, st)
 	case "broadcast":
@@ -691,60 +858,38 @@ func (b *Bot) fsmSetSetting(c tele.Context, st *UserState) error {
 }
 
 func (b *Bot) fsmFindUser(c tele.Context, st *UserState) error {
-	id, err := strconv.ParseInt(strings.TrimSpace(c.Text()), 10, 64)
-	if err != nil {
-		return c.Send("یک آیدی عددی معتبر بفرست.")
+	txt := strings.TrimSpace(c.Text())
+	var u *db.User
+	var err error
+	if id, e := strconv.ParseInt(txt, 10, 64); e == nil {
+		u, err = b.store.GetUser(id)
+	} else {
+		u, err = b.store.FindUserByUsername(txt)
 	}
-	u, err := b.store.GetUser(id)
-	if err != nil {
-		b.clearState(c.Sender().ID)
-		return b.showAdminMenu(c, "کاربری با این آیدی پیدا نشد.")
+	b.clearState(c.Sender().ID)
+	if err != nil || u == nil {
+		return b.showAdminMenu(c, "کاربری با این مشخصات پیدا نشد.")
 	}
-	st.Action = "manage_user"
-	st.Data["uid"] = strconv.FormatInt(id, 10)
-	return b.showUserCard(c, u)
+	return b.showUserCard(c, u, false)
 }
 
-func (b *Bot) fsmManageUser(c tele.Context, st *UserState, txt string) error {
+// fsmUserNumber handles the bonus/cap number prompts opened from a user card.
+func (b *Bot) fsmUserNumber(c tele.Context, st *UserState, bonus bool) error {
+	mb, err := strconv.Atoi(strings.TrimSpace(c.Text()))
+	if err != nil || mb < 0 {
+		return c.Send("یک عدد معتبر بفرست (۰ یا بیشتر).")
+	}
 	id, _ := strconv.ParseInt(st.Data["uid"], 10, 64)
-	fields := strings.Fields(txt)
-	if len(fields) == 0 {
-		return c.Send("دستور نامعتبر.")
-	}
-	switch strings.ToLower(fields[0]) {
-	case "ban":
-		_ = b.store.SetBan(id, true)
-		b.clearState(c.Sender().ID)
-		return b.showAdminMenu(c, "✅ کاربر مسدود شد.")
-	case "unban":
-		_ = b.store.SetBan(id, false)
-		b.clearState(c.Sender().ID)
-		return b.showAdminMenu(c, "✅ رفع مسدودی شد.")
-	case "bonus":
-		if len(fields) < 2 {
-			return c.Send("مثال: bonus 500")
-		}
-		mb, err := strconv.Atoi(fields[1])
-		if err != nil {
-			return c.Send("عدد نامعتبر.")
-		}
+	if bonus {
 		_ = b.store.SetManualBonus(id, mb)
-		b.clearState(c.Sender().ID)
-		return b.showAdminMenu(c, "✅ پاداش دستی ثبت شد.")
-	case "cap":
-		if len(fields) < 2 {
-			return c.Send("مثال: cap 2048 (یا 0 برای حذف)")
-		}
-		mb, err := strconv.Atoi(fields[1])
-		if err != nil {
-			return c.Send("عدد نامعتبر.")
-		}
+	} else {
 		_ = b.store.SetCapOverride(id, mb)
-		b.clearState(c.Sender().ID)
-		return b.showAdminMenu(c, "✅ سقف ثابت ثبت شد.")
-	default:
-		return c.Send("دستور نامعتبر. یکی از: ban, unban, bonus <عدد>, cap <عدد>")
 	}
+	b.clearState(c.Sender().ID)
+	if u, err := b.store.GetUser(id); err == nil {
+		return b.showUserCard(c, u, false)
+	}
+	return b.showAdminMenu(c, "✅ ثبت شد.")
 }
 
 func (b *Bot) fsmAddAdmin(c tele.Context, st *UserState) error {
@@ -762,10 +907,15 @@ func (b *Bot) fsmAddAdmin(c tele.Context, st *UserState) error {
 func (b *Bot) onDocument(c tele.Context) error {
 	uid := c.Sender().ID
 	st := b.getState(uid)
-	if st != nil && st.Action == "broadcast" && b.isAdmin(uid) {
-		return b.doBroadcast(c)
+	if st == nil || !b.isAdmin(uid) {
+		return nil
 	}
-	if st != nil && st.Action == "restore" && b.isAdmin(uid) {
+	switch st.Action {
+	case "broadcast":
+		return b.doBroadcast(c)
+	case "user_msg":
+		return b.deliverAdminDM(c, st)
+	case "restore":
 		return b.doRestore(c)
 	}
 	return nil
@@ -774,8 +924,14 @@ func (b *Bot) onDocument(c tele.Context) error {
 func (b *Bot) onMaybeBroadcastMedia(c tele.Context) error {
 	uid := c.Sender().ID
 	st := b.getState(uid)
-	if st != nil && st.Action == "broadcast" && b.isAdmin(uid) {
+	if st == nil || !b.isAdmin(uid) {
+		return nil
+	}
+	switch st.Action {
+	case "broadcast":
 		return b.doBroadcast(c)
+	case "user_msg":
+		return b.deliverAdminDM(c, st)
 	}
 	return nil
 }
