@@ -165,18 +165,44 @@ func (b *Bot) handleStatus(c tele.Context) error {
 }
 
 func (b *Bot) handleAdvertise(c tele.Context) error {
-	support := b.store.Get(db.KeySupportContact)
+	support := strings.TrimSpace(b.store.Get(db.KeySupportContact))
+	url := supportURL(support)
+
+	msg := `📣 تبلیغ کانال شما
+
+اگر می‌خواهید کانالتان در این ربات تبلیغ شود و ممبر واقعی بگیرید، با پشتیبانی در ارتباط باشید.
+
+ما کانال شما را در صف نمایش قرار می‌دهیم و شما فقط بابت ممبرهای جدید و واقعی هزینه می‌کنید.`
+
+	if url != "" {
+		m := &tele.ReplyMarkup{}
+		m.Inline(m.Row(m.URL("✉️ ارتباط با پشتیبانی", url)))
+		return c.Send(msg, m)
+	}
 	if support == "" {
 		support = "به‌زودی"
 	}
-	msg := fmt.Sprintf(`📣 تبلیغ کانال شما
+	return c.Send(msg + "\n\n☎️ پشتیبانی: " + support)
+}
 
-اگر می‌خواهید کانالتان در این ربات تبلیغ شود و ممبر واقعی بگیرید، با پشتیبانی در ارتباط باشید:
-
-%s
-
-ما کانال شما را در صف نمایش قرار می‌دهیم و فقط بابت ممبرهای جدید واقعی هزینه می‌گیرید.`, support)
-	return c.Send(msg)
+// supportURL turns a support-contact setting (a @username, t.me link or full
+// URL) into a tappable link. Returns "" if it can't form a sensible link.
+func supportURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
+		return raw
+	}
+	h := strings.TrimPrefix(raw, "@")
+	h = strings.TrimPrefix(h, "t.me/")
+	h = strings.TrimPrefix(h, "https://t.me/")
+	h = strings.TrimPrefix(h, "http://t.me/")
+	if h == "" || strings.ContainsAny(h, " \t\n@/") {
+		return "" // not a clean username — show as plain text instead
+	}
+	return "https://t.me/" + h
 }
 
 // fmtVol renders MB as MB or GB.

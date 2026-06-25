@@ -16,8 +16,8 @@ const (
 
 var defaultSettings = map[string]string{
 	KeyRandomChannelsPerDay: "2",
-	KeyBaseDailyMB:          "500",
-	KeyPerReferralBonusMB:   "500",
+	KeyBaseDailyMB:          "512",
+	KeyPerReferralBonusMB:   "512",
 	KeyMaxDailyMB:           "3072",
 	KeyConfigDays:           "1",
 	KeyDefaultSubType:       "auto",
