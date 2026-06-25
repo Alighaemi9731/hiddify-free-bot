@@ -8,6 +8,7 @@ const (
 	KeyMaxDailyMB           = "max_daily_mb"
 	KeyConfigDays           = "config_days"      // package_days for each daily config
 	KeyDefaultSubType       = "default_sub_type" // auto|sub|sub64|clash|clashmeta|singbox
+	KeyDeliveryMode         = "delivery_mode"    // link|configs (give sub link vs raw configs)
 	KeyAcceptingNewUsers    = "accepting_new_users"
 	KeyMaintenance          = "maintenance"
 	KeySupportContact       = "support_contact"
@@ -21,6 +22,7 @@ var defaultSettings = map[string]string{
 	KeyMaxDailyMB:           "3072",
 	KeyConfigDays:           "1",
 	KeyDefaultSubType:       "auto",
+	KeyDeliveryMode:         "link",
 	KeyAcceptingNewUsers:    "1",
 	KeyMaintenance:          "0",
 	KeySupportContact:       "",

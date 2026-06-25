@@ -284,6 +284,7 @@ var settingLabels = []struct {
 	{db.KeyMaxDailyMB, "⬆️ سقف حجم روزانه (MB)", false},
 	{db.KeyConfigDays, "📅 روز اعتبار هر کانفیگ", false},
 	{db.KeyDefaultSubType, "🔗 نوع لینک ساب", false},
+	{db.KeyDeliveryMode, "📤 نحوه تحویل به کاربر", false},
 	{db.KeySupportContact, "☎️ آیدی پشتیبانی", false},
 	{db.KeyBackupKeep, "💾 تعداد بکاپ نگه‌داری", false},
 	{db.KeyAcceptingNewUsers, "🚪 پذیرش کاربر جدید", true},
@@ -300,6 +301,12 @@ func (b *Bot) adminSettings(c tele.Context) error {
 				val = "روشن ✅"
 			} else {
 				val = "خاموش ⛔️"
+			}
+		} else if s.Key == db.KeyDeliveryMode {
+			if val == "configs" {
+				val = "کانفیگ مستقیم"
+			} else {
+				val = "لینک ساب"
 			}
 		} else if val == "" {
 			val = "—"
@@ -320,6 +327,16 @@ func (b *Bot) cbSetting(c tele.Context) error {
 			_ = c.Respond(&tele.CallbackResponse{Text: "تغییر کرد ✅"})
 			return b.adminSettings(c)
 		}
+	}
+	// Delivery mode cycles between the two values on tap.
+	if key == db.KeyDeliveryMode {
+		if b.store.Get(key) == "configs" {
+			_ = b.store.Set(key, "link")
+		} else {
+			_ = b.store.Set(key, "configs")
+		}
+		_ = c.Respond(&tele.CallbackResponse{Text: "تغییر کرد ✅"})
+		return b.adminSettings(c)
 	}
 	_ = c.Respond()
 	st := b.setState(c.Sender().ID, "set_setting")

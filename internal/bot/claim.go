@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	tele "gopkg.in/telebot.v4"
@@ -158,6 +159,15 @@ func (b *Bot) issueConfig(c tele.Context, u *db.User, today string) error {
 			"🎉 یک نفر با لینک دعوت شما کانفیگ گرفت!\nحجم روزانه‌ی شما افزایش پیدا کرد. 🚀")
 	}
 
+	// Deliver raw configs instead of the sub link when configured to do so.
+	if b.store.Get(db.KeyDeliveryMode) == "configs" {
+		if err := b.deliverConfigs(c, sub, capMB); err == nil {
+			return nil
+		} else {
+			log.Printf("deliver configs (falling back to link): %v", err)
+		}
+	}
+
 	msg := fmt.Sprintf(`✅ کانفیگ رایگان امروز شما آماده‌ست!
 
 📦 حجم: %s
@@ -167,6 +177,32 @@ func (b *Bot) issueConfig(c tele.Context, u *db.User, today string) error {
 
 برای آموزش اتصال دکمه «❓ راهنما و آموزش اتصال» رو بزن.`, fmtVol(capMB), sub)
 	return c.Send(msg, tele.ModeMarkdown)
+}
+
+// deliverConfigs fetches the actual configs from the sub link and sends them to
+// the user (as copyable lines, or a .txt file if too long).
+func (b *Bot) deliverConfigs(c tele.Context, sub string, capMB int) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	cfgs, err := hiddify.FetchConfigs(ctx, sub)
+	if err != nil {
+		return err
+	}
+
+	header := fmt.Sprintf("✅ کانفیگ رایگان امروز شما (حجم: %s):\n\nکانفیگ زیر را کپی و در برنامه‌ات Import کن 👇", fmtVol(capMB))
+	joined := strings.Join(cfgs, "\n")
+
+	// One copyable code block keeps each config on its own line; fall back to a
+	// .txt attachment when the message would exceed Telegram's limit.
+	body := "```\n" + joined + "\n```"
+	if len(header)+len(body) <= 3800 {
+		return c.Send(header+"\n\n"+body, tele.ModeMarkdown)
+	}
+	if err := c.Send(header); err != nil {
+		return err
+	}
+	doc := &tele.Document{File: tele.FromReader(strings.NewReader(joined)), FileName: "configs.txt"}
+	return c.Send(doc)
 }
 
 // notifyOrderComplete alerts admins when a quota channel reaches its target.

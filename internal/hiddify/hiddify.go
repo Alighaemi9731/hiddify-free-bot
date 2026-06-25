@@ -18,6 +18,7 @@ package hiddify
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -246,6 +247,74 @@ func (c *Client) DeleteUser(ctx context.Context, id string) error {
 		return nil
 	}
 	return err
+}
+
+var schemeRe = regexp.MustCompile(`(?i)^[a-z][a-z0-9+.-]*://`)
+
+// FetchConfigs downloads a subscription link and returns the real config URIs
+// (vless://, vmess://, trojan://, ss://, …) it contains. Hiddify serves the
+// subscription base64-encoded for known clients, and injects a fake info config
+// (sni=fake_ip_for_sub_link) which is filtered out.
+func FetchConfigs(ctx context.Context, subURL string) ([]string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, subURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "v2rayNG/1.9.5")
+	resp, err := (&http.Client{Timeout: 25 * time.Second}).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("دریافت کانفیگ ناموفق بود: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("لینک ساب خطا داد (HTTP %d)", resp.StatusCode)
+	}
+	cfgs := ParseSubBody(body)
+	if len(cfgs) == 0 {
+		return nil, fmt.Errorf("کانفیگی در لینک ساب پیدا نشد")
+	}
+	return cfgs, nil
+}
+
+// ParseSubBody extracts config URIs from a subscription body (base64 or plain),
+// dropping Hiddify's fake info line.
+func ParseSubBody(body []byte) []string {
+	text := string(body)
+	if !strings.Contains(text, "://") {
+		if dec, ok := tryBase64(text); ok {
+			text = dec
+		}
+	}
+	var out []string
+	for _, ln := range strings.FieldsFunc(text, func(r rune) bool { return r == '\n' || r == '\r' }) {
+		ln = strings.TrimSpace(ln)
+		if ln == "" || !schemeRe.MatchString(ln) {
+			continue
+		}
+		if strings.Contains(ln, "fake_ip_for_sub_link") {
+			continue // Hiddify usage/expiry placeholder, not a real config
+		}
+		out = append(out, ln)
+	}
+	return out
+}
+
+// tryBase64 strips whitespace and attempts std/raw base64 decode; ok is true
+// only if the decoded text actually contains a config URI.
+func tryBase64(s string) (string, bool) {
+	cleaned := strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == ' ' || r == '\t' {
+			return -1
+		}
+		return r
+	}, strings.TrimSpace(s))
+	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+		if dec, err := enc.DecodeString(cleaned); err == nil && strings.Contains(string(dec), "://") {
+			return string(dec), true
+		}
+	}
+	return "", false
 }
 
 // SubLink builds a working subscription URL for a user uuid given the panel's
