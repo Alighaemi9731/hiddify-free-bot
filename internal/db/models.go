@@ -9,6 +9,7 @@ const (
 	KeyConfigDays           = "config_days"      // package_days for each daily config
 	KeyDefaultSubType       = "default_sub_type" // auto|sub|sub64|clash|clashmeta|singbox
 	KeyDeliveryMode         = "delivery_mode"    // link|configs (give sub link vs raw configs)
+	KeyCleanupChunk         = "cleanup_chunk"    // max rowids per bulk-delete request
 	KeyAcceptingNewUsers    = "accepting_new_users"
 	KeyMaintenance          = "maintenance"
 	KeySupportContact       = "support_contact"
@@ -23,6 +24,7 @@ var defaultSettings = map[string]string{
 	KeyConfigDays:           "1",
 	KeyDefaultSubType:       "auto",
 	KeyDeliveryMode:         "link",
+	KeyCleanupChunk:         "400",
 	KeyAcceptingNewUsers:    "1",
 	KeyMaintenance:          "0",
 	KeySupportContact:       "",
@@ -98,12 +100,15 @@ func (c Channel) Revenue() int {
 
 // Claim records one issued config.
 type Claim struct {
-	ID         int64
-	TGID       int64
-	ClaimDate  string
-	PanelID    int64
-	ConfigUUID string
-	SubLink    string
-	VolumeMB   int
-	CreatedAt  string
+	ID          int64
+	TGID        int64
+	ClaimDate   string
+	PanelID     int64
+	ConfigUUID  string
+	SubLink     string
+	VolumeMB    int
+	CreatedAt   string
+	PanelUserID int
+	Status      string
+	ExpireAt    string
 }

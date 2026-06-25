@@ -1,5 +1,7 @@
 package db
 
+import "sort"
+
 // AddPanel inserts a panel and returns its id.
 func (s *Store) AddPanel(p *Panel) (int64, error) {
 	res, err := s.db.Exec(`INSERT INTO panels
@@ -82,11 +84,21 @@ func (s *Store) SetPanelPriority(id int64, p int) error {
 // PickPanelForVolume returns the best enabled panel that can still absorb
 // needMB today (least-loaded first), or nil if none has capacity.
 func (s *Store) PickPanelForVolume(needMB int) (*Panel, error) {
+	cands, err := s.PanelsForVolume(needMB)
+	if err != nil || len(cands) == 0 {
+		return nil, err
+	}
+	return cands[0], nil
+}
+
+// PanelsForVolume returns all enabled panels with budget for needMB, least-used
+// first — so the claim flow can fall through to the next one on ErrPanelFull.
+func (s *Store) PanelsForVolume(needMB int) ([]*Panel, error) {
 	panels, err := s.Panels()
 	if err != nil {
 		return nil, err
 	}
-	var best *Panel
+	var out []*Panel
 	for _, p := range panels {
 		if !p.Enabled {
 			continue
@@ -94,11 +106,10 @@ func (s *Store) PickPanelForVolume(needMB int) (*Panel, error) {
 		if p.DailyVolumeLimitGB > 0 && p.UsedTodayMB+needMB > p.DailyVolumeLimitGB*1024 {
 			continue // would exceed today's budget
 		}
-		if best == nil || p.UsedTodayMB < best.UsedTodayMB {
-			best = p
-		}
+		out = append(out, p)
 	}
-	return best, nil
+	sort.Slice(out, func(i, j int) bool { return out[i].UsedTodayMB < out[j].UsedTodayMB })
+	return out, nil
 }
 
 // AddPanelUsage adds consumed MB to a panel's daily counter.

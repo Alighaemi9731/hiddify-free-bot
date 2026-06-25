@@ -287,6 +287,7 @@ var settingLabels = []struct {
 	{db.KeyDeliveryMode, "📤 نحوه تحویل به کاربر", false},
 	{db.KeySupportContact, "☎️ آیدی پشتیبانی", false},
 	{db.KeyBackupKeep, "💾 تعداد بکاپ نگه‌داری", false},
+	{db.KeyCleanupChunk, "🧹 اندازه دسته‌ی حذف", false},
 	{db.KeyAcceptingNewUsers, "🚪 پذیرش کاربر جدید", true},
 	{db.KeyMaintenance, "🛠 حالت تعمیر", true},
 }

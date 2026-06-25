@@ -24,7 +24,10 @@ CREATE TABLE IF NOT EXISTS daily_claims (
     config_uuid TEXT    NOT NULL,
     sub_link    TEXT    NOT NULL,
     volume_mb   INTEGER NOT NULL,
-    created_at  TEXT    NOT NULL
+    created_at  TEXT    NOT NULL,
+    panel_user_id INTEGER DEFAULT 0,        -- Hiddify numeric id (for bulk delete)
+    status      TEXT    DEFAULT 'active',   -- pending | active
+    expire_at   TEXT    DEFAULT ''          -- UTC RFC3339 when the config truly expires
 );
 CREATE INDEX IF NOT EXISTS idx_claims_tg ON daily_claims(tg_id);
 CREATE INDEX IF NOT EXISTS idx_claims_date ON daily_claims(claim_date);

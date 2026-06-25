@@ -20,16 +20,57 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"html"
 	"io"
+	"math/rand"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+// ErrPanelFull is returned by CreateUser when the panel/admin user limit is hit,
+// so the caller can fall through to another panel.
+var ErrPanelFull = errors.New("panel user limit reached")
+
+// APIError carries the HTTP status + body of a non-2xx panel response.
+type APIError struct {
+	Status int
+	Body   string
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("پنل خطا داد (HTTP %d): %s", e.Status, e.Body)
+}
+
+var panelFullRe = regexp.MustCompile(`(?i)max|limit|quota|ظرفیت|حداکثر`)
+
+// sharedTransport is reused across all panel clients (the default pool is small
+// for multi-panel bursts).
+var sharedTransport = &http.Transport{
+	MaxIdleConns:        100,
+	MaxIdleConnsPerHost: 10,
+	MaxConnsPerHost:     10,
+	IdleConnTimeout:     90 * time.Second,
+	ForceAttemptHTTP2:   true,
+}
+
+// panelLocks serializes writes per panel (each write triggers a server-side
+// quick_apply_users); parallelism across panels is fine.
+var panelLocks sync.Map
+
+func panelMu(key string) *sync.Mutex {
+	mu, _ := panelLocks.LoadOrStore(key, &sync.Mutex{})
+	return mu.(*sync.Mutex)
+}
 
 var uuidRe = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
@@ -121,7 +162,7 @@ func New(p *AdminLinkParts) *Client {
 		domain:    p.Domain,
 		proxyPath: p.ProxyPath,
 		apiKey:    p.AdminUUID,
-		http:      &http.Client{Timeout: 30 * time.Second},
+		http:      &http.Client{Timeout: 30 * time.Second, Transport: sharedTransport},
 	}
 }
 
@@ -129,8 +170,16 @@ func (c *Client) base() string {
 	return fmt.Sprintf("https://%s/%s/api/v2", c.domain, c.proxyPath)
 }
 
+// panelRoot is the Flask-Admin web UI root (NOT under /api/v2) used for bulk actions.
+func (c *Client) panelRoot() string {
+	return fmt.Sprintf("https://%s/%s", c.domain, c.proxyPath)
+}
+
+func (c *Client) lockKey() string { return c.domain + "/" + c.proxyPath }
+
 // User mirrors the Hiddify user object (only the fields we care about).
 type User struct {
+	ID             int     `json:"id,omitempty"` // Hiddify internal rowid (needed for bulk action)
 	UUID           string  `json:"uuid,omitempty"`
 	Name           string  `json:"name,omitempty"`
 	UsageLimitGB   float64 `json:"usage_limit_GB"`
@@ -145,39 +194,76 @@ type User struct {
 	LastOnline     string  `json:"last_online,omitempty"`
 }
 
+// do performs a JSON request with retry/backoff. Idempotent ops (GET/DELETE)
+// retry on 429/5xx; every method retries on a transient network error (create
+// uses our own uuid, so a retried POST is effectively idempotent).
 func (c *Client) do(ctx context.Context, method, path string, body any, out any) error {
-	var rdr io.Reader
+	var payload []byte
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
 			return err
 		}
-		rdr = bytes.NewReader(b)
+		payload = b
 	}
-	req, err := http.NewRequestWithContext(ctx, method, c.base()+path, rdr)
+	idempotent := method == http.MethodGet || method == http.MethodDelete
+	const maxAttempts = 4
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(200<<(attempt-1))*time.Millisecond +
+				time.Duration(rand.Intn(120))*time.Millisecond
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		status, data, err := c.doOnce(ctx, method, c.base()+path, payload, body != nil)
+		if err != nil {
+			lastErr = fmt.Errorf("اتصال به پنل ناموفق بود: %w", err)
+			continue // network error → retry
+		}
+		if status >= 200 && status < 300 {
+			if out != nil && len(data) > 0 {
+				if err := json.Unmarshal(data, out); err != nil {
+					return fmt.Errorf("پاسخ پنل قابل خواندن نبود: %w", err)
+				}
+			}
+			return nil
+		}
+		apiErr := &APIError{Status: status, Body: strings.TrimSpace(string(data))}
+		if idempotent && (status == 429 || status >= 500) {
+			lastErr = apiErr
+			continue
+		}
+		return apiErr
+	}
+	return lastErr
+}
+
+// doOnce performs a single HTTP attempt and returns status + body.
+func (c *Client) doOnce(ctx context.Context, method, fullURL string, payload []byte, hasBody bool) (int, []byte, error) {
+	var rdr io.Reader
+	if payload != nil {
+		rdr = bytes.NewReader(payload)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, fullURL, rdr)
 	if err != nil {
-		return err
+		return 0, nil, err
 	}
 	req.Header.Set("Hiddify-API-Key", c.apiKey)
 	req.Header.Set("Accept", "application/json")
-	if body != nil {
+	if hasBody {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("اتصال به پنل ناموفق بود: %w", err)
+		return 0, nil, err
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("پنل خطا داد (HTTP %d): %s", resp.StatusCode, strings.TrimSpace(string(data)))
-	}
-	if out != nil && len(data) > 0 {
-		if err := json.Unmarshal(data, out); err != nil {
-			return fmt.Errorf("پاسخ پنل قابل خواندن نبود: %w", err)
-		}
-	}
-	return nil
+	return resp.StatusCode, data, nil
 }
 
 // PanelInfo is the response of /panel/info/.
@@ -211,7 +297,9 @@ func (c *Client) Me(ctx context.Context) (*AdminInfo, error) {
 	return &a, nil
 }
 
-// CreateUser creates a user and returns the resulting object (with uuid).
+// CreateUser creates a user and returns the resulting object (with uuid + id).
+// Writes are serialized per panel (each triggers a server-side apply) with a
+// small pace. A panel/admin user-limit response maps to ErrPanelFull.
 func (c *Client) CreateUser(ctx context.Context, u User) (*User, error) {
 	if u.UUID == "" {
 		u.UUID = uuid.NewString()
@@ -220,13 +308,28 @@ func (c *Client) CreateUser(ctx context.Context, u User) (*User, error) {
 		u.Mode = "no_reset"
 	}
 	u.Enable = true
+
+	mu := panelMu(c.lockKey())
+	mu.Lock()
+	defer mu.Unlock()
+
 	var out User
-	if err := c.do(ctx, http.MethodPost, "/admin/user/", u, &out); err != nil {
+	err := c.do(ctx, http.MethodPost, "/admin/user/", u, &out)
+	if err != nil {
+		var ae *APIError
+		if errors.As(err, &ae) && (ae.Status == 400 || ae.Status == 403) && panelFullRe.MatchString(ae.Body) {
+			return nil, ErrPanelFull
+		}
 		return nil, err
 	}
 	// Some panel versions echo an empty body; fall back to what we sent.
 	if out.UUID == "" {
 		out = u
+	}
+	// Pace consecutive writes to the same panel so applies don't pile up.
+	select {
+	case <-time.After(250 * time.Millisecond):
+	case <-ctx.Done():
 	}
 	return &out, nil
 }
@@ -243,10 +346,120 @@ func (c *Client) GetUser(ctx context.Context, id string) (*User, error) {
 // DeleteUser removes a user by uuid. A 404 is treated as success (already gone).
 func (c *Client) DeleteUser(ctx context.Context, id string) error {
 	err := c.do(ctx, http.MethodDelete, "/admin/user/"+id+"/", nil, nil)
-	if err != nil && strings.Contains(err.Error(), "HTTP 404") {
+	var ae *APIError
+	if errors.As(err, &ae) && ae.Status == 404 {
 		return nil
 	}
 	return err
+}
+
+var csrfRe = regexp.MustCompile(`name=["']csrf_token["'][^>]*value=["']([^"']+)["']`)
+
+// BulkUserAction runs Hiddify's native Flask-Admin action (delete|enable|disable)
+// on numeric rowids in ONE request → a single server-side apply for the whole
+// batch (instead of one apply per user). Writes are serialized per panel.
+func (c *Client) BulkUserAction(ctx context.Context, action string, ids []int) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	mu := panelMu(c.lockKey())
+	mu.Lock()
+	defer mu.Unlock()
+
+	jar, _ := cookiejar.New(nil) // the CSRF token is bound to the Flask session cookie
+	httpc := &http.Client{
+		Timeout:       5 * time.Minute, // a big batch apply is slow
+		Transport:     sharedTransport,
+		Jar:           jar,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }, // 302 = ok
+	}
+	listURL := c.panelRoot() + "/admin/user/"
+	actURL := c.panelRoot() + "/admin/user/action/"
+
+	// 1) GET the list page → CSRF token (+ session cookie into the jar).
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, listURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Hiddify-API-Key", c.apiKey)
+	page, err := httpc.Do(req)
+	if err != nil {
+		return err
+	}
+	body, _ := io.ReadAll(io.LimitReader(page.Body, 8<<20))
+	page.Body.Close()
+	m := csrfRe.FindSubmatch(body)
+	if m == nil {
+		return fmt.Errorf("توکن CSRF در صفحه‌ی بالک پیدا نشد (HTTP %d)", page.StatusCode)
+	}
+	csrf := html.UnescapeString(string(m[1]))
+
+	// 2) POST the action (form-encoded, repeated rowid).
+	form := url.Values{}
+	form.Set("csrf_token", csrf)
+	form.Set("url", listURL)
+	form.Set("action", action)
+	for _, id := range ids {
+		form.Add("rowid", strconv.Itoa(id))
+	}
+	req2, err := http.NewRequestWithContext(ctx, http.MethodPost, actURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return err
+	}
+	req2.Header.Set("Hiddify-API-Key", c.apiKey)
+	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := httpc.Do(req2)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 { // 200/302 = success
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		return fmt.Errorf("بالک %s ناموفق بود (HTTP %d): %s", action, resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	return nil
+}
+
+// ResolveUserIDs resolves uuids to Hiddify numeric ids (needed for bulk action),
+// with bounded concurrency. resolved maps uuid→id for users that exist; missing
+// lists uuids that returned 404 (already gone). uuids that fail transiently are
+// in neither (so the caller keeps them for the next run).
+func (c *Client) ResolveUserIDs(ctx context.Context, uuids []string) (resolved map[string]int, missing []string) {
+	type res struct {
+		id      int
+		uuid    string
+		missing bool
+	}
+	sem := make(chan struct{}, 8)
+	out := make(chan res, len(uuids))
+	for _, u := range uuids {
+		go func(u string) {
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			user, err := c.GetUser(ctx, u)
+			if err != nil {
+				var ae *APIError
+				if errors.As(err, &ae) && ae.Status == 404 {
+					out <- res{uuid: u, missing: true}
+					return
+				}
+				out <- res{uuid: u} // transient error → skip this round (retry next run)
+				return
+			}
+			out <- res{id: user.ID, uuid: u}
+		}(u)
+	}
+	resolved = map[string]int{}
+	for range uuids {
+		r := <-out
+		switch {
+		case r.missing:
+			missing = append(missing, r.uuid)
+		case r.id > 0:
+			resolved[r.uuid] = r.id
+		}
+	}
+	return resolved, missing
 }
 
 var schemeRe = regexp.MustCompile(`(?i)^[a-z][a-z0-9+.-]*://`)

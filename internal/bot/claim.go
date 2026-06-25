@@ -2,11 +2,13 @@ package bot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	tele "gopkg.in/telebot.v4"
 
 	"github.com/Alighaemi9731/hiddify-free-bot/internal/db"
@@ -113,44 +115,79 @@ func (b *Bot) sendJoinPrompt(c tele.Context, channels []*db.Channel) error {
 	return c.Send("📣 برای دریافت کانفیگ رایگان امروز، اول در کانال‌های زیر عضو شو و بعد دکمه «✅ عضو شدم» رو بزن:", m)
 }
 
-// issueConfig creates a Hiddify user and sends the subscription link.
+// issueConfig creates a Hiddify user and sends the subscription link, using an
+// outbox (pending→active) so a crash mid-create can never orphan a panel user,
+// and falling through to the next panel if one reports it's full.
 func (b *Bot) issueConfig(c tele.Context, u *db.User, today string) error {
 	capMB := b.store.DailyCapMB(u)
 
-	panel, err := b.store.PickPanelForVolume(capMB)
+	panels, err := b.store.PanelsForVolume(capMB)
 	if err != nil {
 		return c.Send("خطای داخلی هنگام انتخاب پنل.")
 	}
-	if panel == nil {
+	if len(panels) == 0 {
 		return c.Send("😔 فعلاً ظرفیت کانفیگ رایگان تموم شده. لطفاً بعداً دوباره امتحان کن.")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	client := clientFor(panel)
 	tgID := u.TGID
 	name := fmt.Sprintf("free-%d-%s", u.TGID, today)
-	created, err := client.CreateUser(ctx, hiddify.User{
-		Name:         name,
-		UsageLimitGB: float64(capMB) / 1024.0,
-		PackageDays:  b.store.GetInt(db.KeyConfigDays),
-		Mode:         "no_reset",
-		TelegramID:   &tgID,
-		Comment:      "free-daily-bot",
-		Lang:         "fa",
-	})
-	if err != nil {
-		log.Printf("create user on panel %d: %v", panel.ID, err)
-		return c.Send("⚠️ خطا در ساخت کانفیگ. لطفاً چند دقیقه دیگه دوباره امتحان کن.")
+	cfgUUID := uuid.NewString()
+	configDays := b.store.GetInt(db.KeyConfigDays)
+
+	var panel *db.Panel
+	var sub string
+	allFull := true
+	for _, p := range panels {
+		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+		subLink := hiddify.SubLink(p.SubDomain, p.SubProxyPath, cfgUUID, p.SubType, name)
+
+		// Outbox: write the DB row (status=pending) BEFORE creating the panel user.
+		claimID, ierr := b.store.InsertPendingClaim(&db.Claim{
+			TGID: u.TGID, ClaimDate: today, PanelID: p.ID,
+			ConfigUUID: cfgUUID, SubLink: subLink, VolumeMB: capMB,
+		}, configDays)
+		if ierr != nil {
+			cancel()
+			log.Printf("insert pending claim: %v", ierr)
+			return c.Send("خطای داخلی. بعداً امتحان کنید.")
+		}
+
+		created, cerr := clientFor(p).CreateUser(ctx, hiddify.User{
+			UUID:         cfgUUID,
+			Name:         name,
+			UsageLimitGB: float64(capMB) / 1024.0,
+			PackageDays:  configDays,
+			Mode:         "no_reset",
+			TelegramID:   &tgID,
+			Comment:      "free-daily-bot",
+			Lang:         "fa",
+		})
+		cancel()
+
+		if cerr != nil {
+			_ = b.store.DeleteClaimRow(claimID) // roll back the pending row
+			if errors.Is(cerr, hiddify.ErrPanelFull) {
+				log.Printf("panel %d full, trying next", p.ID)
+				continue // try the next panel
+			}
+			allFull = false
+			log.Printf("create user on panel %d: %v", p.ID, cerr)
+			continue
+		}
+
+		// Success → confirm the claim (status=active, usage, last_claim_date).
+		if err := b.store.ConfirmClaim(claimID, u.TGID, p.ID, created.ID, capMB, today); err != nil {
+			log.Printf("confirm claim: %v", err)
+		}
+		panel, sub = p, subLink
+		break
 	}
 
-	sub := hiddify.SubLink(panel.SubDomain, panel.SubProxyPath, created.UUID, panel.SubType, name)
-	if err := b.store.RecordClaim(&db.Claim{
-		TGID: u.TGID, ClaimDate: today, PanelID: panel.ID,
-		ConfigUUID: created.UUID, SubLink: sub, VolumeMB: capMB,
-	}); err != nil {
-		log.Printf("record claim: %v", err)
+	if panel == nil {
+		if allFull {
+			return c.Send("😔 فعلاً ظرفیت کانفیگ رایگان تموم شده. لطفاً بعداً دوباره امتحان کن.")
+		}
+		return c.Send("⚠️ خطا در ساخت کانفیگ. لطفاً چند دقیقه دیگه دوباره امتحان کن.")
 	}
 
 	// Credit the inviter the first time this user actually claims.

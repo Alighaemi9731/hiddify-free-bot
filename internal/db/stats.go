@@ -1,20 +1,46 @@
 package db
 
-// RecordClaim stores an issued config and bumps the panel usage counter.
-func (s *Store) RecordClaim(c *Claim) error {
+import (
+	"database/sql"
+	"time"
+)
+
+// InsertPendingClaim writes the claim row BEFORE the panel user is created
+// (outbox pattern) so a crash mid-create can never orphan a panel user. It does
+// not yet bump panel usage or the user's last_claim_date — see ConfirmClaim.
+// expire_at = created_at + configDays·24h pins the config's real lifetime.
+func (s *Store) InsertPendingClaim(c *Claim, configDays int) (int64, error) {
+	if configDays < 1 {
+		configDays = 1
+	}
+	now := time.Now().UTC()
+	expire := now.Add(time.Duration(configDays) * 24 * time.Hour).Format(time.RFC3339)
+	res, err := s.db.Exec(`INSERT INTO daily_claims
+		(tg_id,claim_date,panel_id,config_uuid,sub_link,volume_mb,created_at,status,expire_at)
+		VALUES(?,?,?,?,?,?,?, 'pending', ?)`,
+		c.TGID, c.ClaimDate, c.PanelID, c.ConfigUUID, c.SubLink, c.VolumeMB, now.Format(time.RFC3339), expire)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// ConfirmClaim marks a pending claim active, records the panel numeric id, bumps
+// the panel's usage and the user's last_claim_date — all atomically.
+func (s *Store) ConfirmClaim(claimID, tgID, panelID int64, panelUserID, volumeMB int, claimDate string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.Exec(`INSERT INTO daily_claims(tg_id,claim_date,panel_id,config_uuid,sub_link,volume_mb,created_at)
-		VALUES(?,?,?,?,?,?,?)`, c.TGID, c.ClaimDate, c.PanelID, c.ConfigUUID, c.SubLink, c.VolumeMB, NowUTC()); err != nil {
+	if _, err := tx.Exec(`UPDATE daily_claims SET status='active', panel_user_id=? WHERE id=?`,
+		panelUserID, claimID); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`UPDATE panels SET used_today_mb=used_today_mb+? WHERE id=?`, c.VolumeMB, c.PanelID); err != nil {
+	if _, err := tx.Exec(`UPDATE panels SET used_today_mb=used_today_mb+? WHERE id=?`, volumeMB, panelID); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`UPDATE users SET last_claim_date=? WHERE tg_id=?`, c.ClaimDate, c.TGID); err != nil {
+	if _, err := tx.Exec(`UPDATE users SET last_claim_date=? WHERE tg_id=?`, claimDate, tgID); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -32,16 +58,15 @@ func (s *Store) LastClaim(tgID int64) (*Claim, error) {
 	return c, nil
 }
 
-// YesterdayConfigs returns config uuids+panel ids claimed before `day` that may
-// be cleaned up from their panels.
+// OldConfig identifies an issued config for cleanup.
 type OldConfig struct {
-	ID         int64
-	PanelID    int64
-	ConfigUUID string
+	ID          int64
+	PanelID     int64
+	ConfigUUID  string
+	PanelUserID int
 }
 
-func (s *Store) ConfigsBefore(day string) ([]OldConfig, error) {
-	rows, err := s.db.Query(`SELECT id,panel_id,config_uuid FROM daily_claims WHERE claim_date < ?`, day)
+func scanOldConfigs(rows *sql.Rows, err error) ([]OldConfig, error) {
 	if err != nil {
 		return nil, err
 	}
@@ -49,7 +74,7 @@ func (s *Store) ConfigsBefore(day string) ([]OldConfig, error) {
 	var out []OldConfig
 	for rows.Next() {
 		var o OldConfig
-		if err := rows.Scan(&o.ID, &o.PanelID, &o.ConfigUUID); err != nil {
+		if err := rows.Scan(&o.ID, &o.PanelID, &o.ConfigUUID, &o.PanelUserID); err != nil {
 			return nil, err
 		}
 		out = append(out, o)
@@ -57,10 +82,50 @@ func (s *Store) ConfigsBefore(day string) ([]OldConfig, error) {
 	return out, rows.Err()
 }
 
-// DeleteClaimRow removes a claim row after its panel user is cleaned up.
+// ExpiredConfigs returns active configs whose lifetime has elapsed. Rows written
+// before per-claim expiry existed (no expire_at) fall back to created_at vs the
+// caller-supplied fallback cutoff (now - configDays·24h).
+func (s *Store) ExpiredConfigs(nowUTC, fallbackUTC string) ([]OldConfig, error) {
+	return scanOldConfigs(s.db.Query(`SELECT id,panel_id,config_uuid,panel_user_id FROM daily_claims
+		WHERE status='active' AND
+		((expire_at!='' AND expire_at<=?) OR (expire_at='' AND created_at<=?))`, nowUTC, fallbackUTC))
+}
+
+// PendingClaimsOlderThan returns pending claims created before the cutoff (UTC
+// RFC3339) — used to reconcile crashed creates.
+func (s *Store) PendingClaimsOlderThan(cutoffUTC string) ([]OldConfig, error) {
+	return scanOldConfigs(s.db.Query(`SELECT id,panel_id,config_uuid,panel_user_id FROM daily_claims
+		WHERE status='pending' AND created_at<=?`, cutoffUTC))
+}
+
+// MarkClaimActive promotes a reconciled pending row (panel user exists).
+func (s *Store) MarkClaimActive(id int64, panelUserID int) error {
+	_, err := s.db.Exec(`UPDATE daily_claims SET status='active', panel_user_id=? WHERE id=?`, panelUserID, id)
+	return err
+}
+
+// DeleteClaimRow removes a single claim row.
 func (s *Store) DeleteClaimRow(id int64) error {
 	_, err := s.db.Exec(`DELETE FROM daily_claims WHERE id=?`, id)
 	return err
+}
+
+// DeleteClaimRows removes many claim rows after their panel users are cleaned up.
+func (s *Store) DeleteClaimRows(ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, id := range ids {
+		if _, err := tx.Exec(`DELETE FROM daily_claims WHERE id=?`, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // Stats is the admin dashboard summary.

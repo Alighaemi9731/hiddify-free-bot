@@ -46,7 +46,10 @@ func Start(tb *tele.Bot, store *db.Store, cfg *config.Config) *cron.Cron {
 	// Hourly: panel health + near-capacity warnings.
 	_, _ = c.AddFunc("0 * * * *", s.healthCheck)
 
-	// Daily at Tehran midnight: send report, then reset budgets + clean up.
+	// Every 30 min: bulk-delete truly-expired configs + reconcile crashed creates.
+	_, _ = c.AddFunc("*/30 * * * *", s.cleanupExpiredConfigs)
+
+	// Daily at Tehran midnight: send report, then reset budgets.
 	_, _ = c.AddFunc("0 0 * * *", func() {
 		s.sendDailyReport()
 		if err := store.ResetPanelUsage(); err != nil {
@@ -55,12 +58,11 @@ func Start(tb *tele.Bot, store *db.Store, cfg *config.Config) *cron.Cron {
 		s.mu.Lock()
 		s.warned = map[int64]bool{}
 		s.mu.Unlock()
-		s.cleanupOldConfigs()
 		log.Printf("daily reset done (Tehran midnight)")
 	})
 
 	c.Start()
-	log.Printf("scheduler started (backup/2h, health/1h, daily report+reset at Tehran midnight)")
+	log.Printf("scheduler started (backup/2h, health/1h, cleanup/30m, report+reset at Tehran midnight)")
 	return c
 }
 
@@ -183,38 +185,150 @@ func (s *Scheduler) notifyAdmins(text string) {
 	}
 }
 
-// cleanupOldConfigs deletes panel users from configs issued before today so the
-// Hiddify panel doesn't accumulate stale daily users.
-func (s *Scheduler) cleanupOldConfigs() {
-	today := db.TehranDay()
-	olds, err := s.store.ConfigsBefore(today)
+// cleanupExpiredConfigs removes panel users whose configs have truly expired
+// (≥ their lifetime), grouped per panel and deleted with ONE bulk Flask-Admin
+// action per chunk → a single server-side apply instead of one per user. It
+// also reconciles crashed creates (pending rows).
+func (s *Scheduler) cleanupExpiredConfigs() {
+	s.reconcilePending()
+
+	now := time.Now().UTC()
+	configDays := s.store.GetInt(db.KeyConfigDays)
+	if configDays < 1 {
+		configDays = 1
+	}
+	fallback := now.Add(-time.Duration(configDays) * 24 * time.Hour).Format(time.RFC3339)
+	olds, err := s.store.ExpiredConfigs(now.Format(time.RFC3339), fallback)
 	if err != nil {
-		log.Printf("list old configs: %v", err)
+		log.Printf("list expired configs: %v", err)
 		return
 	}
 	if len(olds) == 0 {
 		return
 	}
-	clients := map[int64]*hiddify.Client{}
+
+	chunkSize := s.store.GetInt(db.KeyCleanupChunk)
+	if chunkSize < 1 {
+		chunkSize = 400
+	}
+
+	// Group expired configs by panel.
+	byPanel := map[int64][]db.OldConfig{}
 	for _, o := range olds {
-		cl, ok := clients[o.PanelID]
-		if !ok {
-			p, err := s.store.GetPanel(o.PanelID)
-			if err != nil {
-				_ = s.store.DeleteClaimRow(o.ID)
-				continue
+		byPanel[o.PanelID] = append(byPanel[o.PanelID], o)
+	}
+
+	total := 0
+	for panelID, rows := range byPanel {
+		p, err := s.store.GetPanel(panelID)
+		if err != nil { // panel gone → just drop the local rows
+			_ = s.store.DeleteClaimRows(idsOf(rows))
+			continue
+		}
+		cl := clientFor(p)
+
+		// Resolve numeric ids: prefer the cached panel_user_id, else look it up.
+		var ids []int             // panel rowids to bulk-delete
+		var handledClaims []int64 // claim rows covered by this delete (drop on success)
+		var doneClaims []int64    // already-gone rows (drop unconditionally)
+		var needResolve []string  // uuids missing a cached id
+		uuidToClaim := map[string]int64{}
+		for _, o := range rows {
+			uuidToClaim[o.ConfigUUID] = o.ID
+			if o.PanelUserID > 0 {
+				ids = append(ids, o.PanelUserID)
+				handledClaims = append(handledClaims, o.ID)
+			} else {
+				needResolve = append(needResolve, o.ConfigUUID)
 			}
-			cl = clientFor(p)
-			clients[o.PanelID] = cl
+		}
+		if len(needResolve) > 0 {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			resolved, missing := cl.ResolveUserIDs(ctx, needResolve)
+			cancel()
+			for u, id := range resolved {
+				ids = append(ids, id)
+				handledClaims = append(handledClaims, uuidToClaim[u])
+			}
+			for _, u := range missing { // 404 → already gone, drop the row
+				doneClaims = append(doneClaims, uuidToClaim[u])
+			}
+			// uuids that failed transiently are in neither set → kept for next run.
+		}
+
+		// Chunked bulk delete = one apply per chunk. Only drop the handled claim
+		// rows if every chunk succeeded (else keep them to retry).
+		ok := true
+		for start := 0; start < len(ids); start += chunkSize {
+			end := start + chunkSize
+			if end > len(ids) {
+				end = len(ids)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+			if err := cl.BulkUserAction(ctx, "delete", ids[start:end]); err != nil {
+				log.Printf("bulk delete panel %d: %v", panelID, err)
+				ok = false
+				cancel()
+				break // keep rows → retry next run
+			}
+			cancel()
+		}
+		if ok {
+			doneClaims = append(doneClaims, handledClaims...)
+		}
+		if err := s.store.DeleteClaimRows(dedupeIDs(doneClaims)); err != nil {
+			log.Printf("delete claim rows panel %d: %v", panelID, err)
+		}
+		total += len(doneClaims)
+	}
+	if total > 0 {
+		log.Printf("cleanup: removed %d expired configs (bulk)", total)
+	}
+}
+
+// reconcilePending fixes claims whose create may have crashed: pending rows
+// older than 10 min are checked against the panel — present → activate, 404 → drop.
+func (s *Scheduler) reconcilePending() {
+	cutoff := time.Now().UTC().Add(-10 * time.Minute).Format(time.RFC3339)
+	pend, err := s.store.PendingClaimsOlderThan(cutoff)
+	if err != nil || len(pend) == 0 {
+		return
+	}
+	for _, o := range pend {
+		p, err := s.store.GetPanel(o.PanelID)
+		if err != nil {
+			_ = s.store.DeleteClaimRow(o.ID)
+			continue
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		if err := cl.DeleteUser(ctx, o.ConfigUUID); err != nil {
-			log.Printf("delete panel user %s: %v", o.ConfigUUID, err)
-		}
+		u, err := clientFor(p).GetUser(ctx, o.ConfigUUID)
 		cancel()
-		_ = s.store.DeleteClaimRow(o.ID)
+		if err != nil {
+			_ = s.store.DeleteClaimRow(o.ID) // 404 / unreachable → free the slot
+			continue
+		}
+		_ = s.store.MarkClaimActive(o.ID, u.ID)
 	}
-	log.Printf("cleaned up %d expired configs", len(olds))
+}
+
+func idsOf(rows []db.OldConfig) []int64 {
+	out := make([]int64, len(rows))
+	for i, r := range rows {
+		out[i] = r.ID
+	}
+	return out
+}
+
+func dedupeIDs(ids []int64) []int64 {
+	seen := map[int64]bool{}
+	var out []int64
+	for _, id := range ids {
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 func clientFor(p *db.Panel) *hiddify.Client {

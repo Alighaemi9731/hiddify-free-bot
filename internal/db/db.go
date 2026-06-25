@@ -70,6 +70,9 @@ func (s *Store) migrate() error {
 	s.addColumn("channels", "price_per_1k INTEGER DEFAULT 0")
 	s.addColumn("channels", "advertiser TEXT DEFAULT ''")
 	s.addColumn("channels", "notified_done INTEGER DEFAULT 0")
+	s.addColumn("daily_claims", "panel_user_id INTEGER DEFAULT 0")
+	s.addColumn("daily_claims", "status TEXT DEFAULT 'active'")
+	s.addColumn("daily_claims", "expire_at TEXT DEFAULT ''")
 
 	for k, v := range defaultSettings {
 		if _, err := s.db.Exec(`INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)`, k, v); err != nil {
