@@ -78,7 +78,9 @@ func (b *Bot) tryClaim(c tele.Context) error {
 			was, counted := b.store.ChannelUserState(ch.ID, uid)
 			if !counted {
 				if !was {
-					_ = b.store.CreditNewJoin(ch.ID, uid)
+					if done, _ := b.store.CreditNewJoin(ch.ID, uid); done {
+						b.notifyOrderComplete(ch)
+					}
 				} else {
 					_ = b.store.MarkCounted(ch.ID, uid)
 				}
@@ -165,6 +167,20 @@ func (b *Bot) issueConfig(c tele.Context, u *db.User, today string) error {
 
 برای آموزش اتصال دکمه «❓ راهنما و آموزش اتصال» رو بزن.`, fmtVol(capMB), sub)
 	return c.Send(msg, tele.ModeMarkdown)
+}
+
+// notifyOrderComplete alerts admins when a quota channel reaches its target.
+func (b *Bot) notifyOrderComplete(ch *db.Channel) {
+	revenue := ch.QuotaTarget * ch.PricePer1k / 1000
+	msg := fmt.Sprintf("✅ سفارش تبلیغ تکمیل شد!\n\n📣 کانال: %s\n🎯 جوین هدف: %d (تکمیل شد)",
+		channelDisplay(ch), ch.QuotaTarget)
+	if ch.Advertiser != "" {
+		msg += "\n👤 سفارش‌دهنده: " + ch.Advertiser
+	}
+	if revenue > 0 {
+		msg += "\n💰 درآمد این سفارش: " + fmtMoney(revenue)
+	}
+	b.notifyAdmins(msg)
 }
 
 func channelDisplay(ch *db.Channel) string {

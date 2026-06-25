@@ -79,6 +79,7 @@ func (b *Bot) registerHandlers() {
 	b.tb.Handle(tele.OnText, b.onText)
 	b.tb.Handle(tele.OnDocument, b.onDocument)
 	b.tb.Handle(tele.OnPhoto, b.onMaybeBroadcastMedia)
+	b.tb.Handle(tele.OnChatJoinRequest, b.onJoinRequest)
 
 	// Inline callbacks (dynamic ones carry an id in the data).
 	b.tb.Handle(&tele.Btn{Unique: cbVerify}, b.cbVerifyMembership)
@@ -86,6 +87,7 @@ func (b *Bot) registerHandlers() {
 	b.tb.Handle(&tele.Btn{Unique: cbChToggle}, b.cbChannelToggle)
 	b.tb.Handle(&tele.Btn{Unique: cbChQuota}, b.cbChannelSetQuota)
 	b.tb.Handle(&tele.Btn{Unique: cbChPrio}, b.cbChannelSetPriority)
+	b.tb.Handle(&tele.Btn{Unique: cbChPrice}, b.cbChannelSetPrice)
 	b.tb.Handle(&tele.Btn{Unique: cbChStats}, b.cbChannelStats)
 	b.tb.Handle(&tele.Btn{Unique: cbPanelDel}, b.cbPanelDelete)
 	b.tb.Handle(&tele.Btn{Unique: cbPanelToggle}, b.cbPanelToggle)

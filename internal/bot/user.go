@@ -205,6 +205,27 @@ func supportURL(raw string) string {
 	return "https://t.me/" + h
 }
 
+// fmtMoney renders an integer amount with thousands separators + "تومان".
+func fmtMoney(n int) string {
+	s := strconv.Itoa(n)
+	neg := strings.HasPrefix(s, "-")
+	if neg {
+		s = s[1:]
+	}
+	var out []byte
+	for i, d := range []byte(s) {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			out = append(out, ',')
+		}
+		out = append(out, d)
+	}
+	res := string(out)
+	if neg {
+		res = "-" + res
+	}
+	return res + " تومان"
+}
+
 // fmtVol renders MB as MB or GB.
 func fmtVol(mb int) string {
 	if mb >= 1024 && mb%1024 == 0 {

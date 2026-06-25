@@ -71,6 +71,9 @@ type Channel struct {
 	Priority      int
 	Enabled       bool
 	IsJoinRequest bool
+	PricePer1k    int    // advertiser price per 1000 NEW joins
+	Advertiser    string // advertiser name / note
+	NotifiedDone  bool   // completion alert already sent?
 	AddedAt       string
 }
 
@@ -84,6 +87,11 @@ func (c Channel) Remaining() int {
 		return 0
 	}
 	return r
+}
+
+// Revenue returns the earned amount so far = joins/1000 * price_per_1k.
+func (c Channel) Revenue() int {
+	return c.NewJoinsCount * c.PricePer1k / 1000
 }
 
 // Claim records one issued config.

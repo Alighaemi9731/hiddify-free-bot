@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	_ "embed"
 	"fmt"
+	"log"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -63,12 +65,26 @@ func (s *Store) migrate() error {
 	if _, err := s.db.Exec(schemaSQL); err != nil {
 		return fmt.Errorf("apply schema: %w", err)
 	}
+	// Forward-compat for DBs created by older versions (and restored backups):
+	// add columns that CREATE TABLE IF NOT EXISTS would otherwise skip.
+	s.addColumn("channels", "price_per_1k INTEGER DEFAULT 0")
+	s.addColumn("channels", "advertiser TEXT DEFAULT ''")
+	s.addColumn("channels", "notified_done INTEGER DEFAULT 0")
+
 	for k, v := range defaultSettings {
 		if _, err := s.db.Exec(`INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)`, k, v); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// addColumn adds a column if it isn't there yet (ignores "duplicate column").
+func (s *Store) addColumn(table, def string) {
+	if _, err := s.db.Exec("ALTER TABLE " + table + " ADD COLUMN " + def); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column name") {
+		log.Printf("migrate add column %s.%s: %v", table, def, err)
+	}
 }
 
 // DB exposes the raw connection (used by backup/restore).

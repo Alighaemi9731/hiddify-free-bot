@@ -2,12 +2,13 @@ package db
 
 import "math/rand"
 
-const channelCols = `id,chat_id,title,username,invite_link,kind,quota_target,new_joins_count,priority,enabled,is_join_request,added_at`
+const channelCols = `id,chat_id,title,username,invite_link,kind,quota_target,new_joins_count,priority,enabled,is_join_request,price_per_1k,advertiser,notified_done,added_at`
 
 func scanChannel(scan func(...any) error) (*Channel, error) {
 	c := &Channel{}
 	err := scan(&c.ID, &c.ChatID, &c.Title, &c.Username, &c.InviteLink, &c.Kind, &c.QuotaTarget,
-		&c.NewJoinsCount, &c.Priority, &c.Enabled, &c.IsJoinRequest, &c.AddedAt)
+		&c.NewJoinsCount, &c.Priority, &c.Enabled, &c.IsJoinRequest, &c.PricePer1k, &c.Advertiser,
+		&c.NotifiedDone, &c.AddedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -17,17 +18,29 @@ func scanChannel(scan func(...any) error) (*Channel, error) {
 // AddChannel inserts (or replaces by chat_id) a channel.
 func (s *Store) AddChannel(c *Channel) (int64, error) {
 	res, err := s.db.Exec(`INSERT INTO channels
-		(chat_id,title,username,invite_link,kind,quota_target,new_joins_count,priority,enabled,is_join_request,added_at)
-		VALUES(?,?,?,?,?,?,0,?,1,?,?)
+		(chat_id,title,username,invite_link,kind,quota_target,new_joins_count,priority,enabled,is_join_request,price_per_1k,advertiser,added_at)
+		VALUES(?,?,?,?,?,?,0,?,1,?,?,?,?)
 		ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title, username=excluded.username,
 			invite_link=excluded.invite_link, kind=excluded.kind, quota_target=excluded.quota_target,
-			priority=excluded.priority, is_join_request=excluded.is_join_request`,
+			priority=excluded.priority, is_join_request=excluded.is_join_request,
+			price_per_1k=excluded.price_per_1k, advertiser=excluded.advertiser`,
 		c.ChatID, c.Title, c.Username, c.InviteLink, c.Kind, c.QuotaTarget, c.Priority,
-		boolToInt(c.IsJoinRequest), NowUTC())
+		boolToInt(c.IsJoinRequest), c.PricePer1k, c.Advertiser, NowUTC())
 	if err != nil {
 		return 0, err
 	}
 	return res.LastInsertId()
+}
+
+// GetChannelByChat returns the tracked channel for a Telegram chat id, or nil.
+func (s *Store) GetChannelByChat(chatID int64) (*Channel, error) {
+	return scanChannel(s.db.QueryRow(`SELECT `+channelCols+` FROM channels WHERE chat_id=?`, chatID).Scan)
+}
+
+// SetChannelPrice sets the advertiser price per 1000 NEW joins.
+func (s *Store) SetChannelPrice(id int64, price int) error {
+	_, err := s.db.Exec(`UPDATE channels SET price_per_1k=? WHERE id=?`, price, id)
+	return err
 }
 
 // Channels lists all channels ordered by priority then id.
@@ -55,7 +68,10 @@ func (s *Store) SetChannelEnabled(id int64, enabled bool) error {
 }
 
 func (s *Store) SetChannelQuota(id int64, target int) error {
-	_, err := s.db.Exec(`UPDATE channels SET quota_target=? WHERE id=?`, target, id)
+	// Re-arm the completion alert when the target is raised above current joins.
+	_, err := s.db.Exec(`UPDATE channels SET quota_target=?,
+		notified_done=CASE WHEN new_joins_count < ? THEN 0 ELSE notified_done END WHERE id=?`,
+		target, target, id)
 	return err
 }
 
@@ -131,21 +147,35 @@ func (s *Store) ChannelUserState(channelID, tgID int64) (wasMember, counted bool
 }
 
 // CreditNewJoin marks the pair counted and increments the channel's NEW-join
-// counter — used only when the user was NOT a member before.
-func (s *Store) CreditNewJoin(channelID, tgID int64) error {
+// counter — used only when the user was NOT a member before. It returns
+// justCompleted=true the first time a quota channel reaches its target.
+func (s *Store) CreditNewJoin(channelID, tgID int64) (justCompleted bool, err error) {
 	tx, err := s.db.Begin()
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer tx.Rollback()
-	if _, err := tx.Exec(`UPDATE channel_user SET counted=1, joined_at=? WHERE channel_id=? AND tg_id=?`,
+	if _, err = tx.Exec(`UPDATE channel_user SET counted=1, joined_at=? WHERE channel_id=? AND tg_id=?`,
 		NowUTC(), channelID, tgID); err != nil {
-		return err
+		return false, err
 	}
-	if _, err := tx.Exec(`UPDATE channels SET new_joins_count=new_joins_count+1 WHERE id=?`, channelID); err != nil {
-		return err
+	if _, err = tx.Exec(`UPDATE channels SET new_joins_count=new_joins_count+1 WHERE id=?`, channelID); err != nil {
+		return false, err
 	}
-	return tx.Commit()
+	// Detect first-time completion of a quota order.
+	var kind string
+	var count, target, notified int
+	if err = tx.QueryRow(`SELECT kind,new_joins_count,quota_target,notified_done FROM channels WHERE id=?`,
+		channelID).Scan(&kind, &count, &target, &notified); err != nil {
+		return false, err
+	}
+	if kind == "quota" && target > 0 && count >= target && notified == 0 {
+		if _, err = tx.Exec(`UPDATE channels SET notified_done=1 WHERE id=?`, channelID); err != nil {
+			return false, err
+		}
+		justCompleted = true
+	}
+	return justCompleted, tx.Commit()
 }
 
 // MarkCounted flags the pair as counted without crediting a new join (the user

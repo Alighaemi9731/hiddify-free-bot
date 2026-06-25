@@ -97,6 +97,20 @@ type TopReferrer struct {
 	Referrals int
 }
 
+// TotalRevenue sums earned revenue across all channels (joins/1000 * price).
+func (s *Store) TotalRevenue() int {
+	var v int
+	_ = s.db.QueryRow(`SELECT COALESCE(SUM(new_joins_count * price_per_1k / 1000), 0) FROM channels`).Scan(&v)
+	return v
+}
+
+// NewUsersToday counts users created at/after thresholdUTC (start of Tehran day).
+func (s *Store) NewUsersToday(thresholdUTC string) int {
+	var v int
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM users WHERE created_at >= ?`, thresholdUTC).Scan(&v)
+	return v
+}
+
 func (s *Store) TopReferrers(limit int) ([]TopReferrer, error) {
 	rows, err := s.db.Query(`SELECT tg_id,username,referrals_count FROM users
 		WHERE referrals_count > 0 ORDER BY referrals_count DESC LIMIT ?`, limit)

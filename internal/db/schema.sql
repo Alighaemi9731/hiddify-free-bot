@@ -58,6 +58,9 @@ CREATE TABLE IF NOT EXISTS channels (
     priority        INTEGER DEFAULT 0,        -- higher = shown first / finished first
     enabled         INTEGER DEFAULT 1,
     is_join_request INTEGER DEFAULT 0,
+    price_per_1k    INTEGER DEFAULT 0,        -- advertiser price per 1000 NEW joins
+    advertiser      TEXT    DEFAULT '',       -- advertiser name / note
+    notified_done   INTEGER DEFAULT 0,        -- completion alert already sent?
     added_at        TEXT    DEFAULT ''
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_chat ON channels(chat_id);

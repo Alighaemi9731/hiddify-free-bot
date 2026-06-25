@@ -29,7 +29,11 @@ func (b *Bot) adminStats(c tele.Context) error {
 	fmt.Fprintf(&sb, "📊 داشبورد\n\n")
 	fmt.Fprintf(&sb, "👥 کل کاربران: %d (مسدود: %d)\n", st.TotalUsers, st.BannedUsers)
 	fmt.Fprintf(&sb, "🎁 کانفیگ امروز: %d\n📦 کل کانفیگ‌ها: %d\n", st.ClaimsToday, st.ClaimsTotal)
-	fmt.Fprintf(&sb, "🖥 پنل‌ها: %d | 📣 کانال‌ها: %d\n\n", st.TotalPanels, st.TotalChannel)
+	fmt.Fprintf(&sb, "🖥 پنل‌ها: %d | 📣 کانال‌ها: %d\n", st.TotalPanels, st.TotalChannel)
+	if rev := b.store.TotalRevenue(); rev > 0 {
+		fmt.Fprintf(&sb, "💰 درآمد کل تبلیغات: %s\n", fmtMoney(rev))
+	}
+	sb.WriteString("\n")
 
 	panels, _ := b.store.Panels()
 	if len(panels) > 0 {
@@ -98,8 +102,16 @@ func channelCard(ch *db.Channel) string {
 	if target > 0 {
 		pct = done * 100 / target
 	}
-	return fmt.Sprintf("📣 %s\nسفارش جوین: %d/%d (%d%%) | باقی‌مانده: %d\nاولویت: %d | %s",
+	card := fmt.Sprintf("📣 %s\nسفارش جوین: %d/%d (%d%%) | باقی‌مانده: %d\nاولویت: %d | %s",
 		channelDisplay(ch), done, target, pct, ch.Remaining(), ch.Priority, status)
+	if ch.Advertiser != "" {
+		card += "\n👤 سفارش‌دهنده: " + ch.Advertiser
+	}
+	if ch.PricePer1k > 0 {
+		card += fmt.Sprintf("\n💵 قیمت هر ۱۰۰۰ جوین: %s\n💰 درآمد تا الان: %s",
+			fmtMoney(ch.PricePer1k), fmtMoney(ch.Revenue()))
+	}
+	return card
 }
 
 func channelKeyboard(ch *db.Channel) *tele.ReplyMarkup {
@@ -110,9 +122,9 @@ func channelKeyboard(ch *db.Channel) *tele.ReplyMarkup {
 		toggle = "✅ فعال‌کردن"
 	}
 	m.Inline(
-		m.Row(m.Data("🎯 تعداد", cbChQuota, id), m.Data("⭐️ اولویت", cbChPrio, id)),
-		m.Row(m.Data("📊 آمار", cbChStats, id), m.Data(toggle, cbChToggle, id)),
-		m.Row(m.Data("🗑 حذف", cbChDel, id)),
+		m.Row(m.Data("🎯 تعداد", cbChQuota, id), m.Data("💵 قیمت", cbChPrice, id)),
+		m.Row(m.Data("⭐️ اولویت", cbChPrio, id), m.Data("📊 آمار", cbChStats, id)),
+		m.Row(m.Data(toggle, cbChToggle, id), m.Data("🗑 حذف", cbChDel, id)),
 	)
 	return m
 }
@@ -167,6 +179,13 @@ func (b *Bot) cbChannelSetPriority(c tele.Context) error {
 	st := b.setState(c.Sender().ID, "set_prio")
 	st.Data["ch"] = c.Data()
 	return c.Send("عدد اولویت را بفرستید (بزرگ‌تر = مهم‌تر، اول نمایش داده می‌شود).", cancelMenu())
+}
+
+func (b *Bot) cbChannelSetPrice(c tele.Context) error {
+	_ = c.Respond()
+	st := b.setState(c.Sender().ID, "set_price")
+	st.Data["ch"] = c.Data()
+	return c.Send("قیمت هر ۱۰۰۰ جوین را به تومان بفرستید (عدد). ۰ = رایگان/بدون قیمت.", cancelMenu())
 }
 
 // ============================ PANELS ============================
@@ -460,6 +479,8 @@ func (b *Bot) handleStateInput(c tele.Context, st *UserState) error {
 		return b.fsmSetChannelNumber(c, st, true)
 	case "set_prio":
 		return b.fsmSetChannelNumber(c, st, false)
+	case "set_price":
+		return b.fsmSetPrice(c, st)
 	case "add_panel":
 		return b.fsmAddPanel(c, st)
 	case "set_limit":
@@ -498,23 +519,55 @@ func (b *Bot) fsmAddChannel(c tele.Context, st *UserState) error {
 		if err != nil || n < 0 {
 			return c.Send("یک عدد معتبر بفرست (۰ یا بیشتر).")
 		}
-		kind := "quota"
 		if n == 0 {
-			kind = "permanent"
+			// Permanent channel — no quota/price needed.
+			return b.finishAddChannel(c, st, "permanent", 0, 0, "")
 		}
-		chatID, _ := strconv.ParseInt(st.Data["chat_id"], 10, 64)
-		_, err = b.store.AddChannel(&db.Channel{
-			ChatID: chatID, Title: st.Data["title"], Username: st.Data["username"],
-			InviteLink: st.Data["invite"], Kind: kind, QuotaTarget: n,
-		})
-		b.clearState(c.Sender().ID)
-		if err != nil {
-			return b.showAdminMenu(c, "خطا در ذخیره کانال: "+err.Error())
+		st.Data["quota"] = strconv.Itoa(n)
+		st.Data["step"] = "price"
+		return c.Send("قیمت هر ۱۰۰۰ جوین را به تومان بفرست (عدد). اگر می‌خواهی نام سفارش‌دهنده هم ثبت شود، بعد از یک فاصله بنویس.\nمثال: 50000 کانال‌فلان\n(۰ یعنی بدون قیمت)", cancelMenu())
+	case "price":
+		fields := strings.Fields(strings.TrimSpace(c.Text()))
+		if len(fields) == 0 {
+			return c.Send("یک عدد بفرست (۰ یا بیشتر).")
 		}
-		b.store.Audit(c.Sender().ID, "channel_add", st.Data["title"])
-		return b.showAdminMenu(c, "✅ کانال اضافه شد.")
+		price, err := strconv.Atoi(fields[0])
+		if err != nil || price < 0 {
+			return c.Send("قیمت باید عدد باشد.")
+		}
+		advertiser := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(c.Text()), fields[0]))
+		quota, _ := strconv.Atoi(st.Data["quota"])
+		return b.finishAddChannel(c, st, "quota", quota, price, advertiser)
 	}
 	return nil
+}
+
+// finishAddChannel persists a new channel and returns to the admin menu.
+func (b *Bot) finishAddChannel(c tele.Context, st *UserState, kind string, quota, price int, advertiser string) error {
+	chatID, _ := strconv.ParseInt(st.Data["chat_id"], 10, 64)
+	isReq := st.Data["username"] == "" // private channels usually use join requests
+	_, err := b.store.AddChannel(&db.Channel{
+		ChatID: chatID, Title: st.Data["title"], Username: st.Data["username"],
+		InviteLink: st.Data["invite"], Kind: kind, QuotaTarget: quota,
+		PricePer1k: price, Advertiser: advertiser, IsJoinRequest: isReq,
+	})
+	b.clearState(c.Sender().ID)
+	if err != nil {
+		return b.showAdminMenu(c, "خطا در ذخیره کانال: "+err.Error())
+	}
+	b.store.Audit(c.Sender().ID, "channel_add", st.Data["title"])
+	return b.showAdminMenu(c, "✅ کانال اضافه شد.")
+}
+
+func (b *Bot) fsmSetPrice(c tele.Context, st *UserState) error {
+	price, err := strconv.Atoi(strings.TrimSpace(c.Text()))
+	if err != nil || price < 0 {
+		return c.Send("یک عدد معتبر بفرست.")
+	}
+	id, _ := strconv.ParseInt(st.Data["ch"], 10, 64)
+	_ = b.store.SetChannelPrice(id, price)
+	b.clearState(c.Sender().ID)
+	return b.showAdminMenu(c, "✅ قیمت ثبت شد.")
 }
 
 func (b *Bot) fsmSetChannelNumber(c tele.Context, st *UserState, quota bool) error {

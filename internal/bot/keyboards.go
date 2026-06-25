@@ -13,6 +13,7 @@ const (
 	cbChToggle    = "chtog"
 	cbChQuota     = "chquota"
 	cbChPrio      = "chprio"
+	cbChPrice     = "chprice"
 	cbChStats     = "chstats"
 	cbPanelDel    = "pdel"
 	cbPanelToggle = "ptog"
